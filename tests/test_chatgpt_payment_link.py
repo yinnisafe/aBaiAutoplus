@@ -6765,16 +6765,23 @@ def test_paypal_captcha_dom_stripper_js_contains_three_gujumpgate_selectors():
     assert ".captcha-container" in js
 
 
-def test_paypal_captcha_dom_stripper_js_installs_mutation_observer_5min():
-    """JS 必须装 MutationObserver 且 setTimeout 300000ms (5min) 内自动 disconnect。
-    5min 覆盖整个 checkout 流程（含手填 OTP、等 PayPal review、最后跳回 chatgpt），
-    比早期 30s 更鲁棒——PayPal 偶尔会在 form 提交后 1-2min 才注入 captcha 浮层。"""
+def test_paypal_captcha_dom_stripper_js_installs_mutation_observer_20min():
+    """JS 必须装 MutationObserver + 1s setInterval 双保险，setTimeout 1200000ms
+    (20min) 内自动 disconnect/clearInterval。
+
+    20min 覆盖更长的 JP 流程（统一 guest 表单 + SMS OTP 120s 初始 + 多轮
+    Resend + 换号，经常超过早期 5min），比 5min 更鲁棒——PayPal NGRL 异常
+    检测会在 SMS 等待空窗里异步注入 reCAPTCHA authchallenge 浮层。
+    setInterval 主动周期扫补 MutationObserver 漏检（display 切换不触发
+    childList 回调的情况）。"""
     js = payment_module._PAYPAL_CAPTCHA_DOM_STRIPPER_JS
     assert "MutationObserver" in js
     assert "observer.disconnect()" in js
-    # observer 寿命 5min（300000ms），不是早期的 30s
-    assert "300000" in js
-    assert "30000" not in js or js.count("30000") == js.count("300000")  # 仅作为 300000 的子串出现
+    # 周期主动扫（1s ticker）+ 清理
+    assert "setInterval" in js
+    assert "clearInterval" in js
+    # observer/ticker 寿命 20min（1200000ms），不是早期的 5min/30s
+    assert "1200000" in js
     # 防重复装的 sentinel
     assert "__MULTIPAGE_PAYPAL_CAPTCHA_STRIPPER__" in js
 

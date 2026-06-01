@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>ChatGPT / Cursor / Kiro / Grok / Windsurf / Trae 等 13+ AI 平台账号自动注册与管理</b><br/>
+  <b>ChatGPT plus的AI 平台账号自动注册与管理</b><br/>
   <b>协议 / 浏览器双模式 · PayPal浏览器注册+内置 GoPay 协议付款 ChatGPT Plus · Mac / Windows 桌面版一键启动</b>
 </p>
 

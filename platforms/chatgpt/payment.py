@@ -2092,6 +2092,67 @@ def _current_page_url(page, fallback: str = "") -> str:
         return fallback
 
 
+def _is_page_load_error_url(url: str) -> bool:
+    """Chromium 页面加载失败（代理断流 / 连接重置 / DNS 失败）时会落到内部
+    错误页。动态 IP 不稳定断流后，导航通常会停在这些 URL 上。"""
+    lowered = str(url or "").strip().lower()
+    if not lowered:
+        return True
+    return (
+        lowered.startswith("chrome-error://")
+        or "chromewebdata" in lowered
+        or lowered.startswith("chrome://network-error")
+        or lowered in ("about:blank", "about:blank#blocked", "data:,")
+    )
+
+
+def _recover_page_load_if_errored(
+    page,
+    *,
+    timeout_ms: int,
+    log: Callable[[str], None],
+    attempts: int = 3,
+    cancel_check: Callable[[], bool] | None = None,
+) -> bool:
+    """检测并恢复 Chromium 加载失败页（``chrome-error://chromewebdata/`` 等）。
+
+    动态 IP 断流时导航会落到内部错误页。``page.reload()`` 会重新发起上一次
+    导航请求；最多重试 ``attempts`` 次，恢复成正常 URL 返回 ``True``，始终
+    失败返回 ``False``（由调用方决定是否最终判失败）。
+
+    页面本就正常（非错误页）时直接返回 ``True``，不做任何操作。
+    """
+    if not _is_page_load_error_url(_current_page_url(page)):
+        return True
+    reload_timeout = max(int(timeout_ms or 30000), 15000)
+    for attempt in range(1, max(int(attempts or 3), 1) + 1):
+        if callable(cancel_check) and cancel_check():
+            raise RuntimeError("任务已取消")
+        log(
+            f"检测到页面加载失败（疑似代理断流），第 {attempt}/{attempts} 次重新加载: "
+            f"{_current_page_url(page)}"
+        )
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=reload_timeout)
+        except Exception as exc:
+            log(f"  · 重新加载抛错: {exc}")
+        # reload 后等 URL 稳定
+        try:
+            page.wait_for_timeout(1500)
+        except Exception:
+            time.sleep(1.5)
+        if not _is_page_load_error_url(_current_page_url(page)):
+            log(f"  · 页面已恢复: {_current_page_url(page)}")
+            return True
+        backoff_ms = int(2000 * attempt)
+        try:
+            page.wait_for_timeout(backoff_ms)
+        except Exception:
+            time.sleep(backoff_ms / 1000)
+    log(f"页面连续 {attempts} 次重新加载仍失败: {_current_page_url(page)}")
+    return False
+
+
 def _pick_active_page(page):
     """返回同一 BrowserContext 中仍活着的 page。
 
@@ -2535,6 +2596,10 @@ def _approve_paypal_agreement_if_needed(
     )
     if isinstance(click_result, str) and click_result:
         log(f"PayPal 协议确认后当前页面: {click_result}")
+        # 代理断流会让点击后的跳转落到 chrome-error 页，重新加载几次再判
+        if _is_page_load_error_url(click_result):
+            if _recover_page_load_if_errored(page, timeout_ms=timeout_ms, log=log):
+                return _current_page_url(page, paypal_url)
         return click_result
     log("已点击 PayPal 协议确认按钮，等待下一跳")
     # Python 端轮询，避开 paypal.com 的 CSP unsafe-eval 限制
@@ -2546,6 +2611,10 @@ def _approve_paypal_agreement_if_needed(
         label="PayPal 协议确认页",
     )
     final_url = _current_page_url(page, paypal_url)
+    # 代理断流：轮询期间页面落到 chrome-error，重新加载几次再判定
+    if _is_page_load_error_url(final_url):
+        if _recover_page_load_if_errored(page, timeout_ms=timeout_ms, log=log):
+            final_url = _current_page_url(page, paypal_url)
     log(f"PayPal 协议确认后当前页面: {final_url}")
     return final_url
 
@@ -2560,6 +2629,10 @@ def _advance_paypal_intermediate_pages(
     current_url = _current_page_url(page)
     max_paypal_steps = max(int(max_steps or 6), 1)
     for step in range(1, max_paypal_steps + 1):
+        # 代理断流：进入循环时页面可能已经是 chrome-error 页，先尝试恢复
+        if _is_page_load_error_url(current_url):
+            if _recover_page_load_if_errored(page, timeout_ms=timeout_ms, log=log):
+                current_url = _current_page_url(page)
         if not _is_paypal_intermediate_url(current_url):
             return current_url
         log(f"处理 PayPal 中间页第 {step}/{max_paypal_steps} 次: {current_url}")
@@ -2867,7 +2940,10 @@ def _apply_billing_profile_to_ctf_identity(identity: dict, billing_profile: Opti
     identity["card_exp_year"] = str(profile.get("card_exp_year") or CTF_CARD_EXP_YEAR)
     identity["card_cvv"] = str(profile.get("card_cvv") or CTF_CARD_CVV)
     # JP 区：PayPal hosted guest checkout 要求姓名同时填**汉字**和**片假名**，
-    # 还必须有合法的 ``#dateOfBirth``（``YYYY/MM/DD``）。从 ``JP_GIVEN_NAMES``
+    # 还必须有合法的 ``#dateOfBirth``。注意：PayPal hosted 这个字段是带
+    # ``M/D/YYYY`` 掩码的受控 input（``type=tel``），即使是日本区也走美式
+    # 月/日/年布局，**不是** ``YYYY/MM/DD``。早期注释写错了，按 ``YYYY/MM/DD``
+    # 写进去会被 mask 重排成 ``1/9/9207`` 这种 aria-invalid 值。从 ``JP_GIVEN_NAMES``
     # / ``JP_LAST_NAMES`` 各抽一对，保证两份姓名同源；US 池里那对英文姓
     # 名仍保留作 fallback（万一某条 JP 字段未出现，selector 扫不到也能继
     # 续按英文填，行为不退化）。
@@ -2883,11 +2959,12 @@ def _apply_billing_profile_to_ctf_identity(identity: dict, billing_profile: Opti
         identity["jp_full_name"] = f"{last_kanji} {first_kanji}"
         identity["jp_full_name_kana"] = f"{last_kana} {first_kana}"
         # PayPal 出生日期校验：>= 18 周岁。固定 1985-2000 年间，月份
-        # 1-12，日期 1-28（避免 2/29、4/31 这种非法日期）。
+        # 1-12，日期 1-28（避免 2/29、4/31 这种非法日期）。格式 ``MM/DD/YYYY``
+        # 对齐 PayPal hosted ``#dateOfBirth`` 的输入掩码。
         year = 1985 + secrets.randbelow(15)
         month = 1 + secrets.randbelow(12)
         day = 1 + secrets.randbelow(28)
-        identity["date_of_birth"] = f"{year:04d}/{month:02d}/{day:02d}"
+        identity["date_of_birth"] = f"{month:02d}/{day:02d}/{year:04d}"
         # 把 JP 姓名也写入通用字段，让既有 ``#firstName`` / ``#lastName``
         # selector 直接命中（CTF sandbox 用 US 名时这两个字段也是同名走
         # 同一 fill 链路，只是值会被改成日文）。
@@ -3415,10 +3492,19 @@ _PAYPAL_CAPTCHA_DOM_STRIPPER_JS = (
     "                childList: true,\n"
     "                subtree: true\n"
     "            });\n"
+    "            // **额外**：MutationObserver 偶尔会漏（PayPal 用 display 切换\n"
+    "            // 而非 childList 增删，或挑战在 observer 续命间隙出现）。再挂\n"
+    "            // 一个 1s setInterval 主动扫，双保险——尤其覆盖 JP 流程里\n"
+    "            // SMS 等待期间 NGRL 异步注入的 reCAPTCHA authchallenge。\n"
+    "            const ticker = setInterval(strip, 1000);\n"
+    "            // 寿命拉到 20min：JP 的 SMS OTP 流程（120s 初始 + 多轮 resend\n"
+    "            // + 换号）经常超过原来的 5min，observer/ticker 提前死掉会让\n"
+    "            // 后出现的挑战无人清理。\n"
     "            setTimeout(function () {\n"
     "                try { observer.disconnect(); } catch (e) {}\n"
+    "                try { clearInterval(ticker); } catch (e) {}\n"
     "                try { window[SENTINEL] = false; } catch (e) {}\n"
-    "            }, 300000);\n"
+    "            }, 1200000);\n"
     "        } catch (e) {}\n"
     "    }\n"
     "    return strip();\n"
@@ -4367,6 +4453,12 @@ def _wait_for_ctf_after_continue_ready(
         if callable(cancel_check) and cancel_check():
             raise RuntimeError("任务已取消")
         current_url = _current_page_url(page)
+        # 代理断流：加载失败页先尝试重新加载恢复，再继续判定
+        if _is_page_load_error_url(current_url):
+            _recover_page_load_if_errored(
+                page, timeout_ms=timeout_ms, log=log, cancel_check=cancel_check
+            )
+            continue
         if _is_paypal_intermediate_url(current_url):
             _advance_paypal_intermediate_pages(page, timeout_ms=timeout_ms, log=log)
             continue
@@ -4894,6 +4986,97 @@ def _select_ctf_phone_country(page, phone_e164: str, *, log: Callable[[str], Non
     return False
 
 
+def _wait_and_type_dob_by_id(
+    page, element_id: str, value: str, *,
+    log=None, attempts: int = 12, interval_ms: int = 500,
+) -> bool:
+    """专治 PayPal hosted ``#dateOfBirth`` 的 mask 输入框。
+
+    这个字段是 ``type=tel`` + 输入掩码（react-imask 之类）的受控组件，模板
+    是 ``MM/DD/YYYY``。用 JS setter 强写完整字符串会被 mask 在 input 事件
+    里重新解析，常见结果是只保留前 6 字符（``10/09/1985`` → ``10/09/19``），
+    导致 ``aria-invalid=true``。
+
+    可靠做法是模拟真实键入：focus → 全选清空 → 一位位敲数字。mask 库自己
+    会按模板插入 ``/``，最终拿到正确的 10 字符 ``MM/DD/YYYY``。
+    """
+    eid = str(element_id or "").strip()
+    if not eid:
+        return False
+    val = str(value or "")
+    if not val:
+        return True
+    # 只保留数字（去掉可能传入的 ``/``）
+    digits = re.sub(r"\D", "", val)
+    if len(digits) != 8:
+        if callable(log):
+            log(f"  · #{eid} DOB 数字位数不为 8: {digits!r}（原值 {val!r}），回退到 JS 设值")
+        return _wait_and_force_fill_by_id(page, eid, val, log=log, attempts=attempts, interval_ms=interval_ms)
+    check_script = """
+    (id) => {
+      const el = document.getElementById(id);
+      if (!el) return '__noel__';
+      return String(el.value == null ? '' : el.value);
+    }
+    """
+    expected_lengths = (10,)  # MM/DD/YYYY
+    for i in range(max(int(attempts), 1)):
+        try:
+            cur = page.evaluate(check_script, eid)
+        except Exception:
+            cur = "__noel__"
+        if cur == "__noel__":
+            try:
+                page.wait_for_timeout(int(interval_ms))
+            except Exception:
+                time.sleep(interval_ms / 1000)
+            continue
+        # 元素已在：聚焦 → 全选清空 → 逐字符敲入
+        try:
+            loc = page.locator(f"#{eid}").first
+            loc.click()
+        except Exception:
+            try:
+                page.evaluate("(id) => document.getElementById(id) && document.getElementById(id).focus()", eid)
+            except Exception:
+                pass
+        try:
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Delete")
+        except Exception:
+            pass
+        try:
+            # 用小延时让 mask 库每位都能挂上 ``/``
+            page.keyboard.type(digits, delay=40)
+        except Exception:
+            try:
+                loc = page.locator(f"#{eid}").first
+                loc.type(digits, delay=40)
+            except Exception:
+                pass
+        try:
+            page.keyboard.press("Tab")
+        except Exception:
+            pass
+        try:
+            after = page.evaluate(check_script, eid)
+        except Exception:
+            after = ""
+        if isinstance(after, str) and len(after) in expected_lengths and re.fullmatch(r"\d{2}/\d{2}/\d{4}", after or ""):
+            if callable(log):
+                log(f"  · #{eid} 已键入 DOB ✓ ({after})")
+            return True
+        if callable(log):
+            log(f"  · #{eid} 键入 DOB 后值为 {after!r}，重试")
+        try:
+            page.wait_for_timeout(int(interval_ms))
+        except Exception:
+            time.sleep(interval_ms / 1000)
+    if callable(log):
+        log(f"  · #{eid} 多次重试仍未填上 DOB")
+    return False
+
+
 def _wait_and_force_fill_by_id(
     page, element_id: str, value: str, *,
     log=None, attempts: int = 12, interval_ms: int = 500,
@@ -5041,10 +5224,11 @@ def _fill_paypal_unified_guest_form(page, identity: dict, *, log: Callable[[str]
             time.sleep(0.4)
         _wait_and_force_fill_by_id(page, "password", password, log=log_fn)
 
-    # 5) 生年月日（懒加载段，需等渲染）
+    # 5) 生年月日（懒加载段，需等渲染）。这个字段带 mask 模板，用 JS setter
+    # 强写会被 mask 截断（``10/09/1985`` → ``10/09/19``），改成模拟键盘输入。
     dob = str(identity.get("date_of_birth") or "")
     if dob:
-        _wait_and_force_fill_by_id(page, "dateOfBirth", dob, log=log_fn)
+        _wait_and_type_dob_by_id(page, "dateOfBirth", dob, log=log_fn)
 
     # 6) 姓名（懒加载段）：漢字 #firstName/#lastName + 片假名
     #    #countrySpecificFirstName/#countrySpecificLastName
@@ -5108,6 +5292,12 @@ def _fill_paypal_unified_guest_form(page, identity: dict, *, log: Callable[[str]
             def _norm(s):
                 return re.sub(r"[\s/]", "", str(s or ""))
             if _norm(cur) == _norm(fval) or cur == fval:
+                continue
+            # ``dateOfBirth`` 是 mask 输入框，不能用 JS setter 强写（会被
+            # mask 截断成前 6 位），必须用键盘 type。
+            if fid == "dateOfBirth":
+                if _wait_and_type_dob_by_id(page, fid, fval, log=log_fn, attempts=2, interval_ms=200):
+                    refilled += 1
                 continue
             if _force_fill_input_by_id(page, fid, fval, log=log_fn):
                 refilled += 1
@@ -5493,7 +5683,8 @@ def _fill_ctf_payment_form(page, identity: dict, *, log: Callable[[str], None] |
             ),
             labels=(),
         )
-        # 出生日期（``#dateOfBirth``，``YYYY/MM/DD`` 文本格式）
+        # 出生日期（``#dateOfBirth``，``MM/DD/YYYY`` 文本格式；hosted form
+        # 的输入掩码即便 JP 区也走美式 M/D/YYYY 布局）
         _fill_checkout_field(
             page,
             str(identity.get("date_of_birth") or ""),
@@ -6176,6 +6367,12 @@ def _wait_for_chatgpt_return(
         if current_url and current_url != last_logged_url:
             log(f"等待跳回 chatgpt / pay.openai，当前页面: {current_url}")
             last_logged_url = current_url
+        # 代理断流：页面落到 chrome-error 加载失败页，重新加载几次再继续
+        if _is_page_load_error_url(current_url):
+            _recover_page_load_if_errored(
+                page, timeout_ms=int(timeout_ms), log=log, cancel_check=cancel_check
+            )
+            continue
         # PayPal /webapps/hermes 再次确认页：点 "Agree and Continue" 才能继续
         if _paypal_review_page_visible(page):
             try:
@@ -6439,8 +6636,12 @@ def _complete_ctf_sandbox_flow(
                 )
                 break
 
-            # 不是拒号、就是 SMS 没到：点 popup 上 Resend 让 PayPal 重发
+            # 不是拒号、就是 SMS 没到：点 popup 上 Resend 让 PayPal 重发。
+            # Resend 前先 strip 一次——JP 流程等 SMS 期间 PayPal NGRL 异常
+            # 检测常在这个空窗注入 reCAPTCHA authchallenge 浮层（#captchaComponent
+            # / .ngrl-anomalydetection-div），盖住 popup 上的 Resend 按钮。
             if code_attempt < max_resends:
+                _install_paypal_captcha_dom_stripper(page, log=log)
                 if _click_ctf_resend_in_popup(page, log=log):
                     log(
                         f"已点击 Resend，继续等 sms_pool[{pool_index}] "
